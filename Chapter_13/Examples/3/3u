@@ -1,0 +1,3 @@
+set -x
+BUS="`lsusb | grep Delcom | sed -e 's/Device.*//' -e 's/Bus//' -e 's/00//' -e 's/ //g'`"
+cat /sys/kernel/debug/usb/usbmon/${BUS}u

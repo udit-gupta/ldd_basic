@@ -1,0 +1,9 @@
+set -x
+mount -t debugfs none_debugs /sys/kernel/debug
+modprobe usbmon
+
+BUS="`lsusb | egrep -v "root hub" | sed -e 's/Device.*//' -e 's/Bus//' -e 's/00//' -e 's/ //g'`"
+cat /sys/kernel/debug/usb/usbmon/${BUS}u
+
+# rmmod usbmon
+# umount /sys/kernel/debug

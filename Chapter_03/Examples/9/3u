@@ -1,0 +1,17 @@
+DT="`date +%Y%m%d.%H%M%S`"
+set -x
+mount -t debugfs none_debugs /sys/kernel/debug
+modprobe usbmon
+set +x
+echo "########################################"
+echo "## echo "45757265 6b6121" | xxd -r -p ##"
+echo "########################################"
+set -x
+
+sleep 5
+
+BUS="`lsusb | egrep -v "root hub" | tail -1 | sed -e 's/Device.*//' -e 's/Bus//' -e 's/00//' -e 's/ //g'`"
+cat /sys/kernel/debug/usb/usbmon/${BUS}u | tee 3u_${DT}.out
+
+# rmmod usbmon
+# umount /sys/kernel/debug

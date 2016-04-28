@@ -1,0 +1,311 @@
+// Example 10.6	:  workqueue
+//		:  main.c
+//  
+
+// select any unused IRQ from /proc/interrupts
+// #define thisIRQ 13
+
+// select any mouse IRQ from /proc/interrupts
+#define thisIRQ 12
+
+// select either fast or slowhandler
+#define SLOWHANDLER
+// #define FASTHANDLER
+
+// delay of 3-sec
+#define thisDELAY 3*HZ
+
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/version.h>
+#include <linux/kernel.h>
+
+#include <linux/proc_fs.h>
+#include <asm/uaccess.h>
+
+#include <linux/sched.h>
+#include <linux/irq.h>
+#include <linux/interrupt.h>
+
+#include <linux/workqueue.h> // workqueue
+
+#include <linux/slab.h>  // since 2.6.29
+// see http://lwn.net/Articles/319686/
+
+MODULE_LICENSE("GPL");
+
+#define PROC_HELLO_LEN 8
+#define PROC_HELLO_BUFLEN 1024
+#define HELLO "hello"
+#define MYDEV "MYDEV"
+
+#ifdef FASTHANDLER
+	#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,24)
+		#if LINUX_VERSION_CODE <= KERNEL_VERSION(3,18,0)
+			#define MYIRQFLAGS IRQF_DISABLED // fast handler
+		#endif
+	#else
+		#define MYIRQFLAGS SA_INTERRUPT // fast handler
+	#endif
+#endif
+
+#ifdef SLOWHANDLER
+	#if LINUX_VERSION_CODE <= KERNEL_VERSION(3,18,0)
+		#define MYIRQFLAGS IRQF_ENABLED	// slow handler
+	#endif
+#endif
+
+// catchall for now
+#ifndef MYIRQFLAGS
+	#define MYIRQFLAGS IRQF_SHARED
+#endif
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,18,0)
+/*
+ *  initialize a work item's function pointer
+ *  */
+#define PREPARE_WORK(_work, _func)   \
+ do {                                \
+ 			(_work)->func = (_func);       \
+    } while (0)
+
+#define PREPARE_DELAYED_WORK(_work, _func)  \
+   PREPARE_WORK(&(_work)->work, (_func))
+#endif
+
+struct proc_hello_data {
+	char proc_hello_name[PROC_HELLO_LEN + 1];
+	char *proc_hello_value;
+	char proc_hello_flag;
+	struct workqueue_struct *proc_hello_wkq;
+	struct delayed_work *wk;
+};
+
+/*  just for quick reference
+struct delayed_work {
+    struct work_struct work;
+    struct timer_list timer;
+};
+*/
+
+unsigned long irqflags=0;
+int dev_id = 128;
+
+static void write_hello_wk(struct work_struct *work);
+static struct proc_hello_data *hello_data;
+
+static struct proc_dir_entry *proc_hello;
+static struct proc_dir_entry *proc_mydev;
+
+irqreturn_t irq_handler(int irq, void *dev_id,struct pt_regs *regs)
+{
+	static int initialized=0;
+    struct proc_hello_data *usrsp=hello_data;
+
+    int *id=(int *)dev_id;
+
+    if (*id!=128) {
+			printk(KERN_INFO "interrupt id=%d irq=%d\n",*id,irq);
+      return IRQ_HANDLED;
+		}
+	
+	// INIT_DELAYED_WORK anyways calls INIT_WORK internally
+	if (!initialized++) 
+		INIT_DELAYED_WORK(hello_data->wk, write_hello_wk); 
+	else
+		PREPARE_DELAYED_WORK(hello_data->wk, write_hello_wk); 
+
+    queue_delayed_work(usrsp->proc_hello_wkq, usrsp->wk, thisDELAY);
+    printk(KERN_ALERT "2470:10.6: workqueue scheduled!\n");
+    return IRQ_HANDLED;
+}
+
+static void write_hello_wk(struct work_struct *work) {
+	struct proc_hello_data *m=hello_data;
+
+	if (&m->wk->work==work)  {
+	
+    	mb();
+
+		printk("Printing from workqueue .. I got \"%s\" at jiffies=%ld\n", 
+	   m->proc_hello_value, jiffies); 
+
+	}
+	else {
+		printk("Unexpected Address Mismatch: Bailing Out => Doing Nothing!\n");
+	}
+}
+	
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,10,0)
+static int eof[1];
+
+static ssize_t read_hello(struct file *file, char *buf,
+size_t len, loff_t *ppos)
+#else
+static int read_hello (char *buf, char **start, off_t offset,
+    int len, int *eof, void *unused)
+#endif
+{
+	struct proc_hello_data *usrsp=hello_data;
+	int n=0;
+
+	if (*eof) { n=0; }
+	else if (usrsp->proc_hello_flag) {
+	  *eof = 1;
+		usrsp->proc_hello_flag=0;
+		n=sprintf(buf,"See /var/log/messages.\n");
+	}
+	else
+	{
+	  *eof = 1;
+		n=sprintf(buf, "Hello from process %d\njiffies=%ld\n", 
+				(int)current->pid,jiffies);
+  }	  
+ 
+	return n;
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,10,0)
+static ssize_t write_hello(struct file *file, const char __user *buf,
+  size_t count, loff_t *ppos)
+#else
+static int write_hello (struct file *file,const char * buf,
+    unsigned long count, void *data)
+#endif
+{
+	int length=count;
+	struct proc_hello_data *usrsp=hello_data;
+
+	length = (length<PROC_HELLO_BUFLEN)? length:PROC_HELLO_BUFLEN;
+
+	if (copy_from_user(usrsp->proc_hello_value, buf, length)) 
+		return -EFAULT;
+
+	usrsp->proc_hello_value[length-1]=0;
+	usrsp->proc_hello_flag=1;
+
+	return(length);
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,10,0)
+static const struct file_operations proc_fops =
+{
+ .owner = THIS_MODULE,
+ .read  = read_hello,
+ .write = write_hello
+};
+#endif
+
+static int my_init (void) {
+	int rc=0;
+	proc_mydev = proc_mkdir(MYDEV,0);
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,10,0)
+  proc_hello = proc_create("hello", 0777, proc_mydev, &proc_fops);
+#else
+  proc_hello = create_proc_entry(HELLO,0,proc_mydev);
+  proc_hello->read_proc = read_hello;
+  proc_hello->write_proc = write_hello;
+#endif
+
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(2,6,29)
+  proc_hello->owner = THIS_MODULE;
+#endif
+
+	hello_data=(struct proc_hello_data *)
+		kmalloc(sizeof(*hello_data),GFP_KERNEL);
+
+	hello_data->proc_hello_value=(char *)
+		kmalloc(PROC_HELLO_BUFLEN,GFP_KERNEL);
+
+	// no need for a separate memory allocation for wkq.
+	// create_workqueue sets it up
+	// hello_data->proc_hello_wkq=(struct workqueue_struct *)
+		// kmalloc(sizeof(struct workqueue_struct),GFP_KERNEL);
+	hello_data->proc_hello_wkq=create_workqueue(HELLO);
+	
+	hello_data->wk=(struct delayed_work *)
+	    kzalloc(sizeof(struct delayed_work),GFP_KERNEL);
+
+	hello_data->proc_hello_flag=0;
+
+    irqflags=MYIRQFLAGS;
+
+
+    // #if LINUX_VERSION_CODE > KERNEL_VERSION(2,6,30)
+        // if (!can_request_irq(thisIRQ, irqflags))
+        //  free_irq(thisIRQ,(void*)&dev_id);
+    // #endif
+
+        // setup interrupt handler
+   	if ((rc=(request_irq(thisIRQ,
+        	(irq_handler_t) irq_handler,
+       		irqflags,
+       		(char *)"MYDEV_irq_handler",
+       		(void*) &dev_id)))<0) {
+   		printk(KERN_ALERT "2470:10.6: intr not initialized!(RC=%d)\n",rc);
+		  goto err;
+	}
+	else {
+   		printk(KERN_ALERT "2470:10.6: intr initialized!\n");
+	}
+
+    // module init message
+    printk(KERN_ALERT "2470:10.6: main initialized!\n");
+    printk(KERN_ALERT "2470:10.6: memory allocated(hello_data) = %0x(%d bytes)!\n", (int) hello_data, ksize(hello_data));
+    printk(KERN_ALERT "2470:10.6: memory allocated(hello_data->wk) = %0x(%d bytes)!\n", (int) &hello_data->wk, ksize(hello_data->wk));
+    printk(KERN_ALERT "2470:10.6: memory allocated(hello_data->proc_hello_value) = %d!\n", ksize(hello_data->proc_hello_value));
+
+	return 0;
+
+err:
+	while (delayed_work_pending(hello_data->wk)) {
+		cancel_delayed_work_sync(hello_data->wk);
+        printk(KERN_ALERT "2470:10.6: Cancelling delayed work!\n");
+	}
+
+	destroy_workqueue(hello_data->proc_hello_wkq);
+
+	kfree(hello_data->wk);
+	kfree(hello_data->proc_hello_value);
+	kfree(hello_data);
+
+	if (proc_hello)
+		remove_proc_entry (HELLO, proc_mydev);
+	if (proc_mydev)
+		remove_proc_entry (MYDEV, 0);
+
+	return -EFAULT;
+}
+
+static void my_exit (void) {
+
+    // irq
+    // #if LINUX_VERSION_CODE > KERNEL_VERSION(2,6,30)
+    //     if (!can_request_irq(thisIRQ, irqflags))
+    // #endif
+  			free_irq(thisIRQ,&dev_id);
+
+	while (delayed_work_pending(hello_data->wk)) {
+		cancel_delayed_work_sync(hello_data->wk);
+        printk(KERN_ALERT "2470:10.6: Cancelling delayed work!\n");
+	}
+
+	destroy_workqueue(hello_data->proc_hello_wkq);
+
+	kfree(hello_data->wk);
+
+	kfree(hello_data->proc_hello_value);
+	kfree(hello_data);
+
+	if (proc_hello)
+		remove_proc_entry (HELLO, proc_mydev);
+	if (proc_mydev)
+		remove_proc_entry (MYDEV, 0);
+
+    // module exit message
+    printk(KERN_ALERT "2470:10.6: main destroyed!\n");
+}
+
+module_init (my_init);
+module_exit (my_exit);

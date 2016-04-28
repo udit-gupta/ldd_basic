@@ -1,0 +1,3 @@
+set -x
+BUS="`lsusb | grep -i 1d34 | sort -u | sed -e 's/Device.*//' -e 's/Bus//' -e 's/00//' -e 's/ //g'`"
+cat /sys/kernel/debug/usb/usbmon/${BUS}u
